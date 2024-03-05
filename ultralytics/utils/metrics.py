@@ -707,7 +707,7 @@ class DetMetrics(SimpleClass):
         curves_results: TODO
     """
 
-    def __init__(self, save_dir=Path('.'), plot=False, on_plot=None, names=()) -> None:
+    def __init__(self, save_dir=Path(''), plot=False, on_plot=None, names=()) -> None:
         """Initialize a DetMetrics instance with a save directory, plot flag, callback function, and class names."""
         self.save_dir = save_dir
         self.plot = plot
@@ -803,7 +803,7 @@ class SegmentMetrics(SimpleClass):
         results_dict: Returns the dictionary containing all the detection and segmentation metrics and fitness score.
     """
 
-    def __init__(self, save_dir=Path('.'), plot=False, on_plot=None, names=()) -> None:
+    def __init__(self, save_dir=Path(''), plot=False, on_plot=None, names=()) -> None:
         """Initialize a SegmentMetrics instance with a save directory, plot flag, callback function, and class names."""
         self.save_dir = save_dir
         self.plot = plot
@@ -926,7 +926,7 @@ class PoseMetrics(SegmentMetrics):
         results_dict: Returns the dictionary containing all the detection and segmentation metrics and fitness score.
     """
 
-    def __init__(self, save_dir=Path('.'), plot=False, on_plot=None, names=()) -> None:
+    def __init__(self, save_dir=Path(''), plot=False, on_plot=None, names=()) -> None:
         """Initialize the PoseMetrics class with directory path, class names, and plotting options."""
         super().__init__(save_dir, plot, names)
         self.save_dir = save_dir

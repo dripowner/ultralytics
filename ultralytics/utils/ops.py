@@ -145,6 +145,7 @@ def non_max_suppression(
 ):
     """
     Perform non-maximum suppression (NMS) on a set of boxes, with support for masks and multiple labels per box.
+    This function filters out overlapping bounding boxes based on their confidence scores and Intersection over Union (IoU).
 
     Args:
         prediction (torch.Tensor): A tensor of shape (batch_size, num_classes + 4 + num_masks, num_boxes)
@@ -168,101 +169,115 @@ def non_max_suppression(
         max_wh (int): The maximum box width and height in pixels
 
     Returns:
-        (List[torch.Tensor]): A list of length batch_size, where each element is a tensor of
-            shape (num_boxes, 6 + num_masks) containing the kept boxes, with columns
-            (x1, y1, x2, y2, confidence, class, mask1, mask2, ...).
+        (List[torch.Tensor], List[torch.Tensor]): Two lists, one containing the suppressed boxes for each image
+        in the batch, and the other containing the corresponding features of these boxes.
     """
 
-    # Checks
+    # Basic Validity Checks
     assert 0 <= conf_thres <= 1, f'Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0'
     assert 0 <= iou_thres <= 1, f'Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0'
-    if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
-        prediction = prediction[0]  # select only inference output
 
+    # Extract bbox features if prediction is a tuple (YOLOv8 validation model output format)
+    if isinstance(prediction, (list, tuple)):
+        feats = prediction[1]  # Extract detected bbox features
+        prediction = prediction[0]  # Select only inference output
+
+    # Determine device type and handle Apple MPS compatibility
     device = prediction.device
-    mps = 'mps' in device.type  # Apple MPS
-    if mps:  # MPS not fully supported yet, convert tensors to CPU before NMS
+    mps = 'mps' in device.type  # Check for Apple MPS
+    if mps:  # If MPS, convert tensors to CPU before NMS
         prediction = prediction.cpu()
+
+    # Determine batch size and number of classes
     bs = prediction.shape[0]  # batch size
-    nc = nc or (prediction.shape[1] - 4)  # number of classes
-    nm = prediction.shape[1] - nc - 4
-    mi = 4 + nc  # mask start index
+    nc = nc or (prediction.shape[1] - 4)  # number of classes (if not provided)
+    nm = prediction.shape[1] - nc - 4  # number of masks
+    mi = 4 + nc  # index where mask data starts
+
+    # Identify candidate detections (above confidence threshold)
     xc = prediction[:, 4:mi].amax(1) > conf_thres  # candidates
 
-    # Settings
-    # min_wh = 2  # (pixels) minimum box width and height
-    time_limit = 0.5 + max_time_img * bs  # seconds to quit after
-    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
+    # Setup for batch processing
+    time_limit = 0.5 + max_time_img * bs  # Time limit for processing (to prevent excessive computation time)
+    multi_label &= nc > 1  # Enable multi-label only if more than one class
 
-    prediction = prediction.transpose(-1, -2)  # shape(1,84,6300) to shape(1,6300,84)
-    prediction[..., :4] = xywh2xyxy(prediction[..., :4])  # xywh to xyxy
+    # Convert box coordinates from xywh to xyxy format
+    prediction = prediction.transpose(-1, -2)  # Transpose to shape (batch_size, num_boxes, num_attributes)
+    prediction[..., :4] = xywh2xyxy(prediction[..., :4])  # Convert to xyxy
 
-    t = time.time()
-    output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs
-    for xi, x in enumerate(prediction):  # image index, image inference
-        # Apply constraints
-        # x[((x[:, 2:4] < min_wh) | (x[:, 2:4] > max_wh)).any(1), 4] = 0  # width-height
-        x = x[xc[xi]]  # confidence
+    # Initialize outputs
+    output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs  # Empty output tensors for each image in batch
+    output_bbox_feats = []  # List to hold bbox features after NMS
 
-        # Cat apriori labels if autolabelling
+    # Process each image in the batch
+    start_time = time.time()
+    for xi, x in enumerate(prediction):  # Iterate over each image
+        # Apply constraints (e.g., filtering by box size)
+        # [code for applying constraints, if any]
+
+        # Append apriori labels if autolabelling is enabled
         if labels and len(labels[xi]):
             lb = labels[xi]
             v = torch.zeros((len(lb), nc + nm + 4), device=x.device)
-            v[:, :4] = xywh2xyxy(lb[:, 1:5])  # box
-            v[range(len(lb)), lb[:, 0].long() + 4] = 1.0  # cls
-            x = torch.cat((x, v), 0)
+            v[:, :4] = xywh2xyxy(lb[:, 1:5])  # Convert labels to xyxy
+            v[range(len(lb)), lb[:, 0].long() + 4] = 1.0  # Class labels
+            x = torch.cat((x, v), 0)  # Append to predictions
 
-        # If none remain process next image
+        # Skip if no detections remain after constraints
         if not x.shape[0]:
             continue
 
-        # Detections matrix nx6 (xyxy, conf, cls)
+        # Split detections into boxes, classes, and masks
         box, cls, mask = x.split((4, nc, nm), 1)
 
+        # Extract detected bbox features
+        xfeat = [feats[i][xi, ...].unsqueeze(dim=0) for i in range(len(feats))]
+        x_cat = torch.cat([xi.view(xfeat[0].shape[0], nc + 16 * 4, -1) for xi in xfeat], 2)
+        box_feats, cls_feats = x_cat.split((16 * 4, nc), 1)
+        box_feats = box_feats.transpose(-1, -2).squeeze(0)
+        box_feats = box_feats[xc[xi]]
+
+        # Multi-label NMS or single best class NMS
         if multi_label:
             i, j = torch.where(cls > conf_thres)
             x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float(), mask[i]), 1)
-        else:  # best class only
+        else:
             conf, j = cls.max(1, keepdim=True)
             x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
 
-        # Filter by class
+        # Filter by specified classes
         if classes is not None:
             x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
 
-        # Check shape
-        n = x.shape[0]  # number of boxes
-        if not n:  # no boxes
+        # Check and handle excessive number of boxes
+        n = x.shape[0]
+        if not n:  # No boxes to process
             continue
-        if n > max_nms:  # excess boxes
-            x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess boxes
+        if n > max_nms:  # Too many boxes, keep only the top max_nms by confidence
+            x = x[x[:, 4].argsort(descending=True)[:max_nms]]
 
-        # Batched NMS
-        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
-        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
+        # Perform Batched NMS
+        c = x[:, 5:6] * (0 if agnostic else max_wh)  # Class offset for NMS
+        boxes, scores = x[:, :4] + c, x[:, 4]  # Boxes with class offset and scores
         i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-        i = i[:max_det]  # limit detections
+        i = i[:max_det]  # Limit number of detections
 
-        # # Experimental
-        # merge = False  # use merge-NMS
-        # if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
-        #     # Update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
-        #     from .metrics import box_iou
-        #     iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
-        #     weights = iou * scores[None]  # box weights
-        #     x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
-        #     redundant = True  # require redundant detections
-        #     if redundant:
-        #         i = i[iou.sum(1) > 1]  # require redundancy
-
+        # Append NMS results to output
         output[xi] = x[i]
+        box_feats = box_feats[i]  # Select corresponding bbox features
+        output_bbox_feats.append(box_feats)
+
+        # Convert back to original device if using MPS
         if mps:
             output[xi] = output[xi].to(device)
-        if (time.time() - t) > time_limit:
-            LOGGER.warning(f'WARNING ⚠️ NMS time limit {time_limit:.3f}s exceeded')
-            break  # time limit exceeded
 
-    return output
+        # Check for time limit exceeded
+        if (time.time() - start_time) > time_limit:
+            # LOGGER.warning should be defined in your logging configuration
+            LOGGER.warning(f'WARNING ⚠️ NMS time limit {time_limit:.3f}s exceeded')
+            break
+
+    return output, output_bbox_feats
 
 
 def clip_boxes(boxes, shape):

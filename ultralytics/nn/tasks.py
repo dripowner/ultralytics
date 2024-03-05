@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 from ultralytics.nn.modules import (AIFI, C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost, C3x,
                                     Classify, Concat, Conv, Conv2, ConvTranspose, Detect, DWConv, DWConvTranspose2d,
                                     Focus, GhostBottleneck, GhostConv, HGBlock, HGStem, Pose, RepC3, RepConv,
@@ -58,6 +58,43 @@ class BaseModel(nn.Module):
             return self._predict_augment(x)
         return self._predict_once(x, profile, visualize)
 
+    def compute_average_and_normalize(self, input_tensor):
+        """
+        Processes the input tensor through several steps to compute a normalized average.
+        This function first applies adaptive average pooling, then squeezes the tensor to remove singleton dimensions,
+        normalizes the result, and finally converts it into a list.
+
+        Args:
+            input_tensor (torch.Tensor): A 4D tensor with shape [B, L, W, H], where B is the batch size,
+                                         L is the layer count, and W, H are the width and height of each layer.
+
+        Returns:
+            list: A list of normalized values computed from the input tensor.
+        """
+
+        # Step 1: Adaptive Average Pooling
+        # Apply adaptive average pooling to reduce each 20x20 layer to a single value (1x1),
+        # effectively calculating the average of each layer. This results in a tensor of shape (B, 576, 1, 1),
+        # where 576 is the layer count (L), and each layer is reduced to a single average value.
+        avg_pooled = torch.nn.functional.adaptive_avg_pool2d(input_tensor, (1, 1))
+
+        # Step 2: Squeeze Operation
+        # Squeeze the tensor to remove the dimensions with size 1. This operation converts the shape from
+        # (B, 576, 1, 1) to (B, 576), removing the unnecessary spatial dimensions that are now just single values.
+        avg_pooled_squeezed = avg_pooled.squeeze()
+
+        # Step 3: Normalization
+        # Normalize the tensor along the 0th dimension (batch dimension). This step ensures that the values
+        # have a norm (length) of 1, making the features scale-invariant and improving the numerical stability.
+        normalized_tensor = F.normalize(avg_pooled_squeezed, p=2, dim=0)
+
+        # Step 4: Conversion to List
+        # Convert the normalized tensor into a regular list for ease of use and compatibility with non-PyTorch environments.
+        # The resulting list contains the normalized average values of each layer in the input tensor.
+        normalized_list = normalized_tensor.tolist()
+
+        return normalized_list
+
     def _predict_once(self, x, profile=False, visualize=False):
         """
         Perform a forward pass through the network.
@@ -71,7 +108,26 @@ class BaseModel(nn.Module):
             (torch.Tensor): The last output of the model.
         """
         y, dt = [], []  # outputs
+        img_embedding = None
         for m in self.model:
+
+            # Check for specific model head classes during model iteration
+            # The following conditional statement checks if the current module 'm' is an instance
+            # of one of the specified head classes: Detect, Segment, Pose, Classify, or RTDETRDecoder.
+            # These classes represent different types of model heads used for various tasks such as
+            # object detection, segmentation, pose estimation, classification, and real-time detection.
+            # This check is crucial to determine if the model is at a stage where the backbone embedding
+            # needs to be processed before passing it through one of these heads.
+            if isinstance(m, (Detect, Segment, Pose, Classify, RTDETRDecoder)):
+                # Average and Normalize Backbone Embedding
+                # Before the input 'x' is processed by the model head, it is first passed through
+                # the '_average_and_normalize' method. This method computes the average of the 20x20 layers
+                # in the tensor and normalizes the result. This step is essential to ensure that the backbone
+                # embedding is in a suitable form for the head processing. It aids in stabilizing the model's learning
+                # and ensures consistent input features for various tasks, thereby improving the model's performance.
+                # The resulting embedding 'img_embedding' is then ready to be processed by the model head.
+                img_embeddings = self.compute_average_and_normalize(x)
+
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
@@ -80,7 +136,7 @@ class BaseModel(nn.Module):
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
-        return x
+        return x, img_embeddings
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference."""
